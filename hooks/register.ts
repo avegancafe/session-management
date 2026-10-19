@@ -37,11 +37,30 @@ export const clean = (raw: string): string | undefined => {
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s)
 
-/** Asks Haiku for a title under RULES; `body` is what it titles from. */
+/** API errors that mean "this model isn't yours to call", not "try later". */
+const MODEL_REFUSED = new Set([400, 401, 403, 404])
+
+/**
+ * Asks Haiku for a title under RULES; `body` is what it titles from.
+ *
+ * A managed org can keep Haiku out of reach: its `availableModels` allowlist
+ * makes the engine refuse the call, or its provider/gateway answers 4xx for a
+ * model it doesn't serve. Either way the title comes from the session's own
+ * model instead, which the org has necessarily allowed.
+ */
 const generate = async ($: EngineInterface, body: string) => {
   const prompt = `${body}\n\nTitle:`
-  const r = await $.model.complete({ model: 'haiku', system: RULES, prompt, maxTokens: 60, effort: 'low' })
-  return r.isAnswered ? clean(r.text) : undefined
+  const ask = { system: RULES, prompt, maxTokens: 60, effort: 'low' } as const
+  const tried = new Set<string>()
+  for (const next of [async () => 'haiku', () => $.session.model()]) {
+    const model = await next().catch(() => undefined)
+    if (!model || tried.has(model)) continue
+    tried.add(model)
+    const r = await $.model.complete({ ...ask, model }).catch(() => undefined)
+    if (r?.isAnswered) return clean(r.text)
+    if (r && !(r.reason === 'api-error' && r.status !== null && MODEL_REFUSED.has(r.status))) return undefined
+  }
+  return undefined
 }
 
 /** Injected rows (`<task-notification>`, …) and slash commands aren't the person's words. */

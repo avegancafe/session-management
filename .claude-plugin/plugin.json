@@ -1,6 +1,6 @@
 {
   "name": "session-management",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Keeps Claude Code session titles in `feat|fix|chore(Scope): imperative summary` form: Haiku titles each session once from your first prompt, `/autoname` re-titles it from the session history on demand, and `/session-title` shows the title it chose.",
   "author": {
     "name": "Kyle Holzinger",
