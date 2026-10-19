@@ -23,6 +23,15 @@ Restart Claude Code afterwards; plugins load at session start.
 
 Titles use a small Haiku call (about 60 output tokens) per title.
 
+### Managed orgs
+
+If your organization's managed settings keep Haiku out (an `availableModels`
+allowlist, or a Bedrock/Vertex/gateway setup that doesn't serve it), titles fall
+back to the session's current model, so they still appear at a slightly higher
+cost per title. If the org sets `allowManagedHooksOnly`, user-installed plugins
+load no hooks at all; this plugin needs to be installed through managed settings
+there.
+
 ## License
 
 [MIT](LICENSE)

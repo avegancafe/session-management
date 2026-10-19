@@ -159,3 +159,47 @@ test('a slash command as the first prompt is not titled from', async ($, on) => 
   expect((await submit($, '/autoname')).sessionTitle).toBeUndefined()
   expect(prompts).toHaveLength(0)
 })
+
+/** An org whose allowlist (or provider) keeps Haiku out: `haiku` fails as `mode` says, any other model answers. */
+const stubManaged = (on: On, mode: 'refused' | 'api-error' | 'rate-limited', sessionModel = 'claude-opus-5-5') => {
+  const models: string[] = []
+  on('model.complete', (_$, e) => {
+    const { model } = e as { model: string }
+    models.push(model)
+    if (model === 'haiku') {
+      if (mode === 'refused') throw new Error('model haiku is not in availableModels')
+      const status = mode === 'api-error' ? 403 : 429
+      const error = mode === 'api-error' ? 'invalid_request' : 'rate_limit'
+      return { value: { isAnswered: false, reason: 'api-error', status, error, usage: { input_tokens: 0, output_tokens: 0 } } } as never
+    }
+    return { value: { isAnswered: true, text: TITLE, usage: { input_tokens: 1, output_tokens: 1 } } } as never
+  })
+  on('session.model', () => ({ value: sessionModel }) as never)
+  on('command.register', () => ({ value: {} }) as never)
+  on('classic.UserPromptSubmit', () => ({}))
+  return models
+}
+
+test('a managed allowlist that blocks haiku falls back to the session model', async ($, on) => {
+  const models = stubManaged(on, 'refused')
+  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBe(TITLE)
+  expect(models).toEqual(['haiku', 'claude-opus-5-5'])
+})
+
+test('a provider that 4xxs on haiku falls back to the session model', async ($, on) => {
+  const models = stubManaged(on, 'api-error')
+  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBe(TITLE)
+  expect(models).toEqual(['haiku', 'claude-opus-5-5'])
+})
+
+test('a transient haiku error does not spend a call on the session model', async ($, on) => {
+  const models = stubManaged(on, 'rate-limited')
+  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBeUndefined()
+  expect(models).toEqual(['haiku'])
+})
+
+test('no second call when the session model is haiku itself', async ($, on) => {
+  const models = stubManaged(on, 'refused', 'haiku')
+  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBeUndefined()
+  expect(models).toEqual(['haiku'])
+})
