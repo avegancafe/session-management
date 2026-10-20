@@ -91,8 +91,19 @@ export const digest = (messages: readonly { role: string; text: string }[], max 
   return [first, '…', ...tail].join('\n\n')
 }
 
-/** Prompts typed by a person (interactive, or `-p` / SDK); not wakeups or injected messages. */
-const isFromPerson = (source: string | undefined) => source === undefined || source === 'user' || source === 'sdk'
+/** Prompts typed by a person (composer, Remote Control, or `-p` / SDK); not wakeups or injected messages. */
+const isFromPerson = (kind: string) => kind === 'composer' || kind === 'bridge' || kind === 'sdk'
+
+/**
+ * Runs `/rename` from a timer: a hook can't run a command itself (it would
+ * wait on the turn the hook holds), so it runs once the calling hook returns.
+ */
+const rename = ($: EngineInterface, title: string, from: string) =>
+  $.clock.after(0, () => {
+    $.command.run({ command: 'rename', args: title }).catch((err: unknown) => {
+      $.ui.log(`${from}: rename failed: ${err instanceof Error ? err.message : String(err)}`)
+    })
+  })
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -122,38 +133,47 @@ export const register: Register = on => {
     const title = await generate($, body).catch(() => undefined)
     if (!title) return { text: "Couldn't generate a title. Try `/autoname <hint>`." }
     await update($, state, x => ({ ...x, title, done: true }))
-    // A command hook can't run another command (it would wait on the turn
-    // this hook holds), so /rename runs from a timer once this one returns.
-    $.clock.after(0, () => {
-      $.command.run({ command: 'rename', args: title }).catch((err: unknown) => {
-        $.ui.log(`autoname: rename failed: ${err instanceof Error ? err.message : String(err)}`)
-      })
-    })
+    rename($, title, AUTONAME)
     return { text: `Renamed: ${title}` }
   })
 
+  // A session the person names by hand is theirs: the first-prompt title
+  // never overwrites it.
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    await update($, state, x => ({ ...x, done: true }))
+    return next(e)
+  })
+
   // Titles the session once, from the first message the person sends, and
-  // never touches it again.
-  on('classic.UserPromptSubmit', async ($, e, next) => {
+  // never touches it again. This is `prompt.submit`, not the classic
+  // UserPromptSubmit: on a managed machine the built-in sec-default plugin
+  // sends classic events past every user-installed plugin's hooks.
+  on('prompt.submit', async ($, e, next) => {
     const result = await next(e)
-    if (result.block || !isFromPerson(e.source)) return result
+    if (result.drop !== undefined || e.command || e.isMeta || !isFromPerson(e.origin.kind)) return result
 
     const s = await read($, state)
     if (s.done) return result
-    if (e.session_title) {
-      // Already named (resumed, renamed by hand, or started with a name).
-      await update($, state, x => ({ ...x, done: true }))
-      return result
-    }
 
-    const text = e.prompt.trim()
+    const text = e.text.trim()
     if (!text || !isPersonText(text)) return result
 
     // Mark done first, so a slow or failed call never retries on a later prompt.
     await update($, state, x => ({ ...x, done: true }))
-    const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
-    if (!title) return result
-    await update($, state, x => ({ ...x, title }))
-    return { ...result, sessionTitle: title }
+    // A resumed session already has its name: the person spoke before this prompt.
+    const earlier = (await $.session.messages()).filter(
+      m => m.role === 'user' && m.text.trim() !== text && isPersonText(m.text.trim()),
+    )
+    if (earlier.length > 0) return result
+
+    // Titled from a timer, off the turn's critical path: the prompt has
+    // already entered, and the hook returns without waiting on the model.
+    $.clock.after(0, async () => {
+      const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
+      if (!title) return
+      await update($, state, x => ({ ...x, title }))
+      rename($, title, COMMAND)
+    })
+    return result
   })
 }

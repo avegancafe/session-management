@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-19
+
+### Fixed
+- The first-prompt title now appears on managed machines. It hooked the classic `UserPromptSubmit` event, which Claude Code's built-in `sec-default` plugin sends past every user-installed plugin wherever managed settings exist (and for Team and Enterprise orgs), so it never ran there. It now hooks `prompt.submit` and applies the title with `/rename`, as `/autoname` does.
+
+### Changed
+- The title is generated off the turn's critical path: your first prompt no longer waits on the model call. The title lands a moment later.
+- A session you `/rename` by hand before your first prompt keeps its name, and a resumed session (one where you'd already spoken) is never retitled.
+
 ## [1.1.0] - 2026-10-19
 
 ### Fixed
