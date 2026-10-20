@@ -6,19 +6,57 @@ import { clean, digest } from './register'
 
 const TITLE = 'feat(SessionTitle): auto-name sessions by convention'
 
-const stub = (on: On, reply: string) => {
+type Opts = { history?: { role: string; text: string }[]; drop?: string }
+
+/**
+ * The engine beneath the mod: prompts enter the transcript after `history`
+ * (rows from before a resume) or are dropped by a settings hook beneath, and
+ * `/rename` is recorded. Rows the person didn't type are framed in tags, as
+ * the engine frames notifications and command lines.
+ */
+const engine = (on: On, opts: Opts = {}) => {
+  on('command.register', () => ({ value: {} }) as never)
+  const rows = (opts.history ?? []).map(r => ({ ...r, toolUses: [] }))
+  on('prompt.submit', (_$, e) => {
+    if (opts.drop) return { drop: opts.drop }
+    const framed = e.command
+      ? `<command-name>/${e.command.name}</command-name>`
+      : e.isMeta || e.origin.kind !== 'composer'
+        ? `<${e.origin.kind}>${e.text}</${e.origin.kind}>`
+        : e.text
+    rows.push({ role: 'user', text: framed, toolUses: [] })
+    return { text: e.text }
+  })
+  on('session.messages', () => ({ value: rows }) as never)
+  const renames: string[] = []
+  on('command.run', { command: 'rename' }, (_$, e) => {
+    renames.push(e.args)
+    return { text: 'renamed' }
+  })
+  const clock = mock.clock(on)
+  return { renames, clock }
+}
+
+/** The engine, with a model that answers `reply` and records what it was asked. */
+const stub = (on: On, reply: string, opts: Opts = {}) => {
   const prompts: string[] = []
   on('model.complete', (_$, e) => {
     prompts.push(String(e.prompt))
     return { value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } } } as never
   })
-  on('command.register', () => ({ value: {} }) as never)
-  on('classic.UserPromptSubmit', () => ({}))
-  return prompts
+  return { prompts, ...engine(on, opts) }
 }
 
-const submit = ($: Engine, prompt: string, opts: { session_title?: string; source?: string } = {}) =>
-  $.classic.UserPromptSubmit({ prompt, source: 'user', ...opts } as never)
+type Submit = { kind?: string; isMeta?: true; command?: { name: string; args: string } }
+
+/** Submits a prompt, then lets the mod's timers (title, then /rename) run. */
+const submit = async ($: Engine, clock: { advance: (ms: number) => Promise<unknown> }, text: string, opts: Submit = {}) => {
+  const { kind = 'composer', ...rest } = opts
+  const r = await $.prompt.submit({ text, origin: { kind }, wait: false, ...rest } as never)
+  await clock.advance(1)
+  await clock.advance(1)
+  return r
+}
 
 test('clean normalizes sloppy replies and rejects junk', () => {
   expect(clean('`Feat(claudePlugins): Add session title mod.`')).toBe('feat(ClaudePlugins): add session title mod')
@@ -29,45 +67,70 @@ test('clean normalizes sloppy replies and rejects junk', () => {
   expect(long!.length <= 72).toBe(true)
 })
 
-test('first prompt is titled from that prompt alone', async ($, on) => {
-  const prompts = stub(on, TITLE)
-  const r = await submit($, 'make a hook that renames sessions')
-  expect(r.sessionTitle).toBe(TITLE)
+test('first prompt is titled from that prompt alone, by /rename', async ($, on) => {
+  const { prompts, renames, clock } = stub(on, TITLE)
+  const r = await submit($, clock, 'make a hook that renames sessions')
+  expect(r).toEqual({ text: 'make a hook that renames sessions' })
   expect(prompts).toHaveLength(1)
   expect(prompts[0]).toContain('make a hook that renames sessions')
+  expect(renames).toEqual([TITLE])
+  expect((await $.command.run({ command: 'session-title', args: '' } as never)).text).toBe(TITLE)
 })
 
 test('later prompts never retitle or call the model', async ($, on) => {
-  const prompts = stub(on, TITLE)
-  await submit($, 'first')
-  const r2 = await submit($, 'second', { session_title: TITLE })
-  const r3 = await submit($, 'third')
-  expect(r2.sessionTitle).toBeUndefined()
-  expect(r3.sessionTitle).toBeUndefined()
+  const { prompts, renames, clock } = stub(on, TITLE)
+  await submit($, clock, 'first')
+  await submit($, clock, 'second')
+  await submit($, clock, 'third')
   expect(prompts).toHaveLength(1)
+  expect(renames).toEqual([TITLE])
 })
 
 test('injected prompts are skipped and do not use up the first prompt', async ($, on) => {
-  const prompts = stub(on, TITLE)
-  expect((await submit($, 'task finished', { source: 'system' })).sessionTitle).toBeUndefined()
-  expect((await submit($, 'wake up', { source: 'loop_wakeup' })).sessionTitle).toBeUndefined()
+  const { prompts, renames, clock } = stub(on, TITLE)
+  await submit($, clock, 'task finished', { kind: 'task-notification' })
+  await submit($, clock, 'wake up', { kind: 'scheduled-trigger' })
+  await submit($, clock, 'hidden', { isMeta: true })
   expect(prompts).toHaveLength(0)
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBe(TITLE)
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([TITLE])
 })
 
-test('an already-named session is left alone', async ($, on) => {
-  const prompts = stub(on, TITLE)
-  const r = await submit($, 'continue', { session_title: 'my own name' })
-  expect(r.sessionTitle).toBeUndefined()
-  await submit($, 'more')
+test('a resumed session is left alone', async ($, on) => {
+  const { prompts, renames, clock } = stub(on, TITLE, {
+    history: [
+      { role: 'user', text: 'fix the flaky export test' },
+      { role: 'assistant', text: 'Fixed.' },
+    ],
+  })
+  await submit($, clock, 'continue')
+  await submit($, clock, 'more')
   expect(prompts).toHaveLength(0)
+  expect(renames).toHaveLength(0)
+})
+
+test('a session renamed by hand is left alone', async ($, on) => {
+  const { prompts, renames, clock } = stub(on, TITLE)
+  await $.command.run({ command: 'rename', args: 'my own name' } as never)
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(prompts).toHaveLength(0)
+  expect(renames).toEqual(['my own name'])
+})
+
+test('a dropped prompt is not titled from', async ($, on) => {
+  const { prompts, renames, clock } = stub(on, TITLE, { drop: 'blocked by policy' })
+  expect(await submit($, clock, 'make a hook that renames sessions')).toEqual({ drop: 'blocked by policy' })
+  await submit($, clock, 'try again')
+  expect(prompts).toHaveLength(0)
+  expect(renames).toHaveLength(0)
 })
 
 test('a junk model reply gives no title and is not retried', async ($, on) => {
-  const prompts = stub(on, 'Sure! Here is a title')
-  expect((await submit($, 'first')).sessionTitle).toBeUndefined()
-  expect((await submit($, 'second')).sessionTitle).toBeUndefined()
+  const { prompts, renames, clock } = stub(on, 'Sure! Here is a title')
+  await submit($, clock, 'first')
+  await submit($, clock, 'second')
   expect(prompts).toHaveLength(1)
+  expect(renames).toHaveLength(0)
 })
 
 const HISTORY = [
@@ -78,21 +141,13 @@ const HISTORY = [
   { role: 'user', text: 'now add a /autoname command too', toolUses: [] },
 ]
 
-const stubAutoname = (on: On, reply: string, history: unknown[] = HISTORY) => {
-  const prompts = stub(on, reply)
-  const renames: string[] = []
-  on('session.messages', () => ({ value: history }) as never)
+const stubAutoname = (on: On, reply: string, history = HISTORY) => {
   const logs: string[] = []
   on('ui.log', (_$, e) => {
     logs.push(String((e as { text: string }).text))
     return { value: undefined } as never
   })
-  const clock = mock.clock(on)
-  on('command.run', { command: 'rename' }, (_$, e) => {
-    renames.push(e.args)
-    return { text: 'renamed' }
-  })
-  return { prompts, renames, logs, clock }
+  return { ...stub(on, reply, { history }), logs }
 }
 
 const autoname = ($: Engine, args = '') => $.command.run({ command: 'autoname', args } as never)
@@ -148,16 +203,19 @@ test('/autoname with a junk reply says so and does not rename', async ($, on) =>
 })
 
 test('after /autoname the first-prompt path never fires', async ($, on) => {
-  const { prompts } = stubAutoname(on, TITLE)
+  const { prompts, renames, clock } = stubAutoname(on, TITLE)
   await autoname($)
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBeUndefined()
+  await submit($, clock, 'make a hook that renames sessions')
   expect(prompts).toHaveLength(1)
+  expect(renames).toEqual([TITLE])
 })
 
 test('a slash command as the first prompt is not titled from', async ($, on) => {
-  const prompts = stub(on, TITLE)
-  expect((await submit($, '/autoname')).sessionTitle).toBeUndefined()
+  const { prompts, clock } = stub(on, TITLE)
+  await submit($, clock, '/session-title', { command: { name: 'session-title', args: '' } })
   expect(prompts).toHaveLength(0)
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(prompts).toHaveLength(1)
 })
 
 /** An org whose allowlist (or provider) keeps Haiku out: `haiku` fails as `mode` says, any other model answers. */
@@ -175,31 +233,33 @@ const stubManaged = (on: On, mode: 'refused' | 'api-error' | 'rate-limited', ses
     return { value: { isAnswered: true, text: TITLE, usage: { input_tokens: 1, output_tokens: 1 } } } as never
   })
   on('session.model', () => ({ value: sessionModel }) as never)
-  on('command.register', () => ({ value: {} }) as never)
-  on('classic.UserPromptSubmit', () => ({}))
-  return models
+  return { models, ...engine(on) }
 }
 
 test('a managed allowlist that blocks haiku falls back to the session model', async ($, on) => {
-  const models = stubManaged(on, 'refused')
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBe(TITLE)
+  const { models, renames, clock } = stubManaged(on, 'refused')
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([TITLE])
   expect(models).toEqual(['haiku', 'claude-opus-5-5'])
 })
 
 test('a provider that 4xxs on haiku falls back to the session model', async ($, on) => {
-  const models = stubManaged(on, 'api-error')
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBe(TITLE)
+  const { models, renames, clock } = stubManaged(on, 'api-error')
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([TITLE])
   expect(models).toEqual(['haiku', 'claude-opus-5-5'])
 })
 
 test('a transient haiku error does not spend a call on the session model', async ($, on) => {
-  const models = stubManaged(on, 'rate-limited')
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBeUndefined()
+  const { models, renames, clock } = stubManaged(on, 'rate-limited')
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([])
   expect(models).toEqual(['haiku'])
 })
 
 test('no second call when the session model is haiku itself', async ($, on) => {
-  const models = stubManaged(on, 'refused', 'haiku')
-  expect((await submit($, 'make a hook that renames sessions')).sessionTitle).toBeUndefined()
+  const { models, renames, clock } = stubManaged(on, 'refused', 'haiku')
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([])
   expect(models).toEqual(['haiku'])
 })
