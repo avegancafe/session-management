@@ -10,7 +10,10 @@ const HISTORY_LEN = 6000
 
 const state = atom({ plugin: 'session-management', key: 'sessionTitle' } as const, { done: false } as TitleState)
 
-export const TITLE_RE = /^(fix|chore|feat)\([A-Z][A-Za-z0-9]*\): [a-z0-9].*\S$/
+/** A trailing word a truncated title shouldn't end on. */
+const DANGLING_RE = /\s+(and|or|but|the|a|an|to|of|for|with|in|on)$/i
+
+export const TITLE_RE =/^(fix|chore|feat)\([A-Z][A-Za-z0-9]*\): [a-z0-9].*\S$/
 
 const RULES = `You name coding sessions. Reply with ONE line and nothing else, in exactly this form:
 
@@ -31,7 +34,11 @@ export const clean = (raw: string): string | undefined => {
   const [, type = '', scope = '', desc = ''] = m ?? []
   if (!type || !scope || !desc) return undefined
   let title = `${type.toLowerCase()}(${scope.charAt(0).toUpperCase()}${scope.slice(1)}): ${desc.charAt(0).toLowerCase()}${desc.slice(1)}`
-  if (title.length > MAX_LEN) title = title.slice(0, title.lastIndexOf(' ', MAX_LEN))
+  if (title.length > MAX_LEN) {
+    // Cut at a word boundary, then drop filler the cut left dangling ("… skipping and").
+    title = title.slice(0, title.lastIndexOf(' ', MAX_LEN))
+    while (DANGLING_RE.test(title)) title = title.replace(DANGLING_RE, '')
+  }
   return TITLE_RE.test(title) ? title : undefined
 }
 

@@ -67,6 +67,16 @@ test('clean normalizes sloppy replies and rejects junk', () => {
   expect(long!.length <= 72).toBe(true)
 })
 
+test('a truncated title never ends on a dangling filler word', () => {
+  expect(clean('chore(SessionManagement): investigate prompt submit hook skipping and sec-default bypass')).toBe(
+    'chore(SessionManagement): investigate prompt submit hook skipping',
+  )
+  expect(clean('fix(Billing): retry failed invoice exports when queue backs up for the nightly batch')).toBe(
+    'fix(Billing): retry failed invoice exports when queue backs up',
+  )
+  expect(clean('fix(Auth): handle expired tokens and the rest')).toBe('fix(Auth): handle expired tokens and the rest')
+})
+
 test('first prompt is titled from that prompt alone, by /rename', async ($, on) => {
   const { prompts, renames, clock } = stub(on, TITLE)
   const r = await submit($, clock, 'make a hook that renames sessions')
