@@ -26,6 +26,7 @@ hooks/hooks.json             # { "modules": ["./register.ts"] }
 hooks/register.ts            # The session-title mod: auto title, /session-title, /autoname
 hooks/register.test.ts       # Mod tests (claude-code/testing)
 types/index.d.ts             # PluginState typing
+skills/archive-session/SKILL.md  # /archive-session: archive this desktop session
 .github/workflows/ci.yml     # validate + version<->CHANGELOG
 .github/workflows/release.yml  # notify the marketplace on version change
 ```
