@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-10-31
+
+### Fixed
+- The automatic title no longer closes a question Claude is asking you. It was applied with `/rename` the moment it was ready, which is usually mid-way through your first turn; a command queued while a turn is running landed on whatever that turn was waiting on (an `AskUserQuestion` prompt, a plan approval) and dismissed it, most visibly in the Claude desktop app. The title now waits until the turn has ended and the session has stood idle for half a second, so `/rename` only ever runs when no question can be open. A subagent's turn ending doesn't count, an interrupted turn holds the title for the next one, and a `/rename` the engine refuses is tried again at the next turn's end. `/autoname` sends its rename the same way.
+- A `/rename` by hand during your first turn now always wins: the automatic title waiting for that turn to end is dropped.
+
+### Known limitation
+- A rename from the desktop app's title bar or sidebar doesn't pass through `/rename`, so the mod can't see it. Done during your first turn, it is overwritten when that turn ends. Rename after the first turn, or with `/rename`, to keep your own name.
+
 ## [1.2.1] - 2026-10-20
 
 ### Fixed

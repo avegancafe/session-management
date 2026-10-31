@@ -8,6 +8,7 @@ const AUTONAME = 'autoname'
 const MAX_LEN = 72
 const HISTORY_LEN = 6000
 
+const PLUGIN = 'session-management' // this plugin's name, as the engine stamps `e.origin`
 const state = atom({ plugin: 'session-management', key: 'sessionTitle' } as const, { done: false } as TitleState)
 
 /** A trailing word a truncated title shouldn't end on. */
@@ -102,17 +103,74 @@ export const digest = (messages: readonly { role: string; text: string }[], max 
 const isFromPerson = (kind: string) => kind === 'composer' || kind === 'bridge' || kind === 'sdk'
 
 /**
- * Runs `/rename` from a timer: a hook can't run a command itself (it would
- * wait on the turn the hook holds), so it runs once the calling hook returns.
+ * How long a turn's end must stand before `/rename` is sent: a prompt queued
+ * behind that turn starts the next one within it, and the send waits again.
  */
-const rename = ($: EngineInterface, title: string, from: string) =>
-  $.clock.after(0, () => {
-    $.command.run({ command: 'rename', args: title }).catch((err: unknown) => {
-      $.ui.log(`${from}: rename failed: ${err instanceof Error ? err.message : String(err)}`)
+export const SETTLE_MS = 500
+
+// The title is applied with `/rename` through `$.command.run`, which puts it
+// in the session's input queue. Queued while a turn is under way, it lands on
+// whatever that turn waits on — a question or plan-approval prompt — and
+// closes it. So a title waits in `pending` and is sent only while no main-loop
+// turn is open: when it's ready, if the session is idle, else when the turn
+// ends. An idle session runs the command at once, so it is never left in the
+// queue for a prompt that opens later. Reset by each load of the module.
+let turnOpen = false
+let starts = 0 // main-loop turns begun; a change means a turn began after the end
+let ends = 0 // main-loop turns ended
+let renames = 0 // /rename runs by hand (not this mod's own)
+
+/** Sends the pending title with `/rename` once the session has stood idle for SETTLE_MS. */
+const sendWhenIdle = ($: EngineInterface) => {
+  if (turnOpen) return
+  const seen = starts
+  const named = renames
+  const busy = () => turnOpen || starts !== seen
+  // A /rename by hand since this send was scheduled wins: it is checked after
+  // every await, and inside each write, so the title is neither sent over the
+  // person's name nor put back once they've replaced it.
+  const renamed = () => renames !== named
+  const keep = (title: string) => update($, state, x => (renamed() ? x : { ...x, pending: x.pending ?? title }))
+  // A hook can't run a command itself (it would wait on the turn the hook
+  // holds), so the send runs from a timer, after the calling hook returns.
+  $.clock.after(SETTLE_MS, async () => {
+    const { pending: title } = await read($, state)
+    if (!title || busy() || renamed()) return
+    await update($, state, x => ({ ...x, pending: undefined }))
+    if (renamed()) return
+    if (busy()) return void (await keep(title))
+    $.command.run({ command: 'rename', args: title }).catch(async (err: unknown) => {
+      $.ui.log(`${COMMAND}: rename failed: ${err instanceof Error ? err.message : String(err)}`)
+      await keep(title) // for the next turn's end
     })
   })
+}
 
 export const register: Register = on => {
+  turnOpen = false
+  starts = 0
+  ends = 0
+  renames = 0
+
+  on('turn.start', ($, e, next) => {
+    if (e.agentId === undefined) {
+      turnOpen = true
+      starts += 1
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) return result
+    turnOpen = false
+    ends += 1
+    // After an interrupt the engine refuses plugin commands until the person
+    // acts again; the title waits for the next turn's end.
+    if (!e.isAborted) sendWhenIdle($)
+    return result
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: COMMAND, description: 'Show the auto session title' })
     await $.command.register({
@@ -139,15 +197,17 @@ export const register: Register = on => {
       .join('\n\n')
     const title = await generate($, body).catch(() => undefined)
     if (!title) return { text: "Couldn't generate a title. Try `/autoname <hint>`." }
-    await update($, state, x => ({ ...x, title, done: true }))
-    rename($, title, AUTONAME)
+    await update($, state, x => ({ ...x, title, pending: title, done: true }))
+    sendWhenIdle($)
     return { text: `Renamed: ${title}` }
   })
 
   // A session the person names by hand is theirs: the first-prompt title
-  // never overwrites it.
+  // never overwrites it, even one still waiting for the turn to end.
   on('command.run', { command: 'rename' }, async ($, e, next) => {
-    await update($, state, x => ({ ...x, done: true }))
+    if (e.origin?.kind === 'plugin' && e.origin.name === PLUGIN) return next(e)
+    renames += 1
+    await update($, state, x => ({ ...x, pending: undefined, done: true }))
     return next(e)
   })
 
@@ -156,8 +216,12 @@ export const register: Register = on => {
   // UserPromptSubmit: on a managed machine the built-in sec-default plugin
   // sends classic events past every user-installed plugin's hooks.
   on('prompt.submit', async ($, e, next) => {
+    const ended = ends
     const result = await next(e)
     if (result.drop !== undefined || e.command || e.isMeta || !isFromPerson(e.origin.kind)) return result
+    // The prompt entered and its turn started; held open even if this mod
+    // never hears that turn's start, until it hears the end.
+    if (ends === ended) turnOpen = true
 
     const s = await read($, state)
     if (s.done) return result
@@ -175,11 +239,13 @@ export const register: Register = on => {
 
     // Titled from a timer, off the turn's critical path: the prompt has
     // already entered, and the hook returns without waiting on the model.
+    // The title is sent once the session is idle (see sendWhenIdle).
+    const handled = renames
     $.clock.after(0, async () => {
       const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
-      if (!title) return
-      await update($, state, x => ({ ...x, title }))
-      rename($, title, COMMAND)
+      if (!title || renames !== handled) return
+      await update($, state, x => (renames !== handled ? x : { ...x, title, pending: title }))
+      if (renames === handled) sendWhenIdle($)
     })
     return result
   })

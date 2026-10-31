@@ -2,11 +2,11 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { clean, digest } from './register'
+import { clean, digest, SETTLE_MS } from './register'
 
 const TITLE = 'feat(SessionTitle): auto-name sessions by convention'
 
-type Opts = { history?: { role: string; text: string }[]; drop?: string }
+type Opts = { history?: { role: string; text: string }[]; drop?: string; failRenames?: number }
 
 /**
  * The engine beneath the mod: prompts enter the transcript after `history`
@@ -29,10 +29,14 @@ const engine = (on: On, opts: Opts = {}) => {
   })
   on('session.messages', () => ({ value: rows }) as never)
   const renames: string[] = []
+  let refusals = opts.failRenames ?? 0
   on('command.run', { command: 'rename' }, (_$, e) => {
+    if (refusals-- > 0) throw new Error('refused while a Stop stands')
     renames.push(e.args)
     return { text: 'renamed' }
   })
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
   const clock = mock.clock(on)
   return { renames, clock }
 }
@@ -49,12 +53,37 @@ const stub = (on: On, reply: string, opts: Opts = {}) => {
 
 type Submit = { kind?: string; isMeta?: true; command?: { name: string; args: string } }
 
-/** Submits a prompt, then lets the mod's timers (title, then /rename) run. */
-const submit = async ($: Engine, clock: { advance: (ms: number) => Promise<unknown> }, text: string, opts: Submit = {}) => {
+type Clock = { advance: (ms: number) => Promise<unknown> }
+
+let turns = 0
+const turnStart = ($: Engine, agentId?: string) => {
+  const turnId = `turn-${++turns}`
+  return $.turn.start({ text: '', turnId, ...(agentId && { agentId }) } as never).then(() => turnId)
+}
+const turnEnd = ($: Engine, turnId: string, opts: { agentId?: string; isAborted?: boolean } = {}) =>
+  $.turn.complete({
+    answer: '',
+    durationMs: 1,
+    turnId,
+    isAborted: opts.isAborted === true,
+    reason: opts.isAborted ? 'aborted' : 'answer',
+    ...(opts.agentId && { agentId: opts.agentId }),
+  } as never)
+
+/** Lets the mod's title timer run, mid-turn. */
+const settleTitle = async (clock: Clock) => {
+  await clock.advance(1)
+  await clock.advance(1)
+}
+
+/** Submits a prompt and runs its turn to the end, letting the mod's timers (title, then /rename) run. */
+const submit = async ($: Engine, clock: Clock, text: string, opts: Submit = {}) => {
   const { kind = 'composer', ...rest } = opts
   const r = await $.prompt.submit({ text, origin: { kind }, wait: false, ...rest } as never)
-  await clock.advance(1)
-  await clock.advance(1)
+  const turnId = await turnStart($)
+  await settleTitle(clock)
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS)
   return r
 }
 
@@ -143,6 +172,136 @@ test('a junk model reply gives no title and is not retried', async ($, on) => {
   expect(renames).toHaveLength(0)
 })
 
+/** The first prompt is in, its turn has started and its title is ready, but the turn hasn't ended. */
+const openFirstTurn = async ($: Engine, clock: Clock, text = 'make a hook that renames sessions') => {
+  await $.prompt.submit({ text, origin: { kind: 'composer' }, wait: false } as never)
+  const turnId = await turnStart($)
+  await settleTitle(clock)
+  return turnId
+}
+
+const shown = async ($: Engine) => (await $.command.run({ command: 'session-title', args: '' } as never)).text
+
+test('the title is never sent while the turn is open, and is sent once it has ended', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  // Claude is waiting on a question or plan approval: nothing is queued.
+  await clock.advance(SETTLE_MS * 20)
+  expect(renames).toEqual([])
+  expect(await shown($)).toBe(TITLE)
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS - 1)
+  expect(renames).toEqual([])
+  await clock.advance(1)
+  expect(renames).toEqual([TITLE])
+})
+
+test("the title waits for the turn's end even if the mod never hears the turn start", async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  await $.prompt.submit({ text: 'make a hook that renames sessions', origin: { kind: 'composer' }, wait: false } as never)
+  await settleTitle(clock)
+  await clock.advance(SETTLE_MS * 4)
+  expect(renames).toEqual([])
+  await turnEnd($, 'unheard-turn')
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test("a subagent's turn ending doesn't send it", async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  const sub = await turnStart($, 'agent-1')
+  await turnEnd($, sub, { agentId: 'agent-1' })
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([])
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test('a turn that starts before the end has settled holds the title until it ends too', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  await turnEnd($, await openFirstTurn($, clock))
+  await clock.advance(SETTLE_MS / 2)
+  const next = await turnStart($) // a prompt queued behind the first turn
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([])
+  await turnEnd($, next)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test('an interrupted turn holds the title for the next turn to end', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  await turnEnd($, await openFirstTurn($, clock), { isAborted: true })
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([])
+  await submit($, clock, 'carry on')
+  expect(renames).toEqual([TITLE])
+})
+
+test('a title ready after a quick turn has ended is sent while the session is idle', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  await $.prompt.submit({ text: 'what is 2+2', origin: { kind: 'composer' }, wait: false } as never)
+  await turnEnd($, await turnStart($))
+  await settleTitle(clock)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test('a refused /rename keeps the title for the next turn to end', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE, { failRenames: 1 })
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([])
+  await submit($, clock, 'carry on')
+  expect(renames).toEqual([TITLE])
+  await submit($, clock, 'and more')
+  expect(renames).toEqual([TITLE])
+})
+
+test('a /rename by hand while the title waits wins', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  await $.command.run({ command: 'rename', args: 'my own name' } as never)
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual(['my own name'])
+})
+
+test('a /rename by hand that lands while the send is under way wins, and the title is not put back', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  // The person renames at the moment the timer clears `pending`, between its
+  // read and its send.
+  let raced = false
+  on('state.set', async (_$, e, next) => {
+    const { value, previous } = e as unknown as { value?: { pending?: string }; previous?: { pending?: string } }
+    if (!raced && previous?.pending === TITLE && value?.pending === undefined) {
+      raced = true
+      void $.command.run({ command: 'rename', args: 'my own name' } as never)
+    }
+    return next(e)
+  })
+  await turnEnd($, await openFirstTurn($, clock))
+  await clock.advance(SETTLE_MS)
+  await clock.advance(SETTLE_MS)
+  expect(raced).toBe(true)
+  expect(renames).toEqual(['my own name'])
+  await submit($, clock, 'carry on')
+  expect(renames).toEqual(['my own name'])
+})
+
+test('a /rename by hand while the title is still being written wins', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  await $.prompt.submit({ text: 'make a hook', origin: { kind: 'composer' }, wait: false } as never)
+  const turnId = await turnStart($)
+  await $.command.run({ command: 'rename', args: 'my own name' } as never)
+  await settleTitle(clock)
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual(['my own name'])
+  expect(await shown($)).toBe('(no title yet)')
+})
+
 const HISTORY = [
   { role: 'user', text: 'make a hook that renames sessions', toolUses: [] },
   { role: 'assistant', text: 'Here is the plan for the hook.', toolUses: [] },
@@ -179,7 +338,7 @@ test('digest keeps the person and Claude, drops injected rows, keeps first + new
 test('bare /autoname titles from the session history and renames', async ($, on) => {
   const { prompts, renames, logs, clock } = stubAutoname(on, TITLE)
   const r = await autoname($)
-  await clock.advance(1)
+  await clock.advance(SETTLE_MS)
   expect(logs).toEqual([])
   expect(r.text).toBe(`Renamed: ${TITLE}`)
   expect(prompts).toHaveLength(1)
@@ -200,7 +359,7 @@ test('/autoname <hint> adds the hint on top of the history', async ($, on) => {
 test('/autoname with no history and no hint does nothing', async ($, on) => {
   const { prompts, renames, clock } = stubAutoname(on, TITLE, [])
   expect((await autoname($)).text).toBe('Nothing to title yet.')
-  await clock.advance(1)
+  await clock.advance(SETTLE_MS)
   expect(prompts).toHaveLength(0)
   expect(renames).toHaveLength(0)
 })
@@ -208,13 +367,14 @@ test('/autoname with no history and no hint does nothing', async ($, on) => {
 test('/autoname with a junk reply says so and does not rename', async ($, on) => {
   const { renames, clock } = stubAutoname(on, 'Sure! Here is a title')
   expect((await autoname($)).text).toContain("Couldn't generate a title")
-  await clock.advance(1)
+  await clock.advance(SETTLE_MS)
   expect(renames).toHaveLength(0)
 })
 
 test('after /autoname the first-prompt path never fires', async ($, on) => {
   const { prompts, renames, clock } = stubAutoname(on, TITLE)
   await autoname($)
+  await clock.advance(SETTLE_MS)
   await submit($, clock, 'make a hook that renames sessions')
   expect(prompts).toHaveLength(1)
   expect(renames).toEqual([TITLE])
