@@ -268,6 +268,28 @@ test('a /rename by hand while the title waits wins', async ($, on) => {
   expect(renames).toEqual(['my own name'])
 })
 
+test('a /rename by hand that lands while the send is under way wins, and the title is not put back', async ($, on) => {
+  const { renames, clock } = stub(on, TITLE)
+  // The person renames at the moment the timer clears `pending`, between its
+  // read and its send.
+  let raced = false
+  on('state.set', async (_$, e, next) => {
+    const { value, previous } = e as unknown as { value?: { pending?: string }; previous?: { pending?: string } }
+    if (!raced && previous?.pending === TITLE && value?.pending === undefined) {
+      raced = true
+      void $.command.run({ command: 'rename', args: 'my own name' } as never)
+    }
+    return next(e)
+  })
+  await turnEnd($, await openFirstTurn($, clock))
+  await clock.advance(SETTLE_MS)
+  await clock.advance(SETTLE_MS)
+  expect(raced).toBe(true)
+  expect(renames).toEqual(['my own name'])
+  await submit($, clock, 'carry on')
+  expect(renames).toEqual(['my own name'])
+})
+
 test('a /rename by hand while the title is still being written wins', async ($, on) => {
   const { renames, clock } = stub(on, TITLE)
   await $.prompt.submit({ text: 'make a hook', origin: { kind: 'composer' }, wait: false } as never)

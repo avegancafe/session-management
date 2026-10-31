@@ -124,19 +124,24 @@ let renames = 0 // /rename runs by hand (not this mod's own)
 const sendWhenIdle = ($: EngineInterface) => {
   if (turnOpen) return
   const seen = starts
+  const named = renames
   const busy = () => turnOpen || starts !== seen
+  // A /rename by hand since this send was scheduled wins: it is checked after
+  // every await, and inside each write, so the title is neither sent over the
+  // person's name nor put back once they've replaced it.
+  const renamed = () => renames !== named
+  const keep = (title: string) => update($, state, x => (renamed() ? x : { ...x, pending: x.pending ?? title }))
   // A hook can't run a command itself (it would wait on the turn the hook
   // holds), so the send runs from a timer, after the calling hook returns.
   $.clock.after(SETTLE_MS, async () => {
     const { pending: title } = await read($, state)
-    if (!title || busy()) return
+    if (!title || busy() || renamed()) return
     await update($, state, x => ({ ...x, pending: undefined }))
-    if (busy()) return void (await update($, state, x => ({ ...x, pending: x.pending ?? title })))
-    const before = renames
+    if (renamed()) return
+    if (busy()) return void (await keep(title))
     $.command.run({ command: 'rename', args: title }).catch(async (err: unknown) => {
       $.ui.log(`${COMMAND}: rename failed: ${err instanceof Error ? err.message : String(err)}`)
-      // Kept for the next turn's end, unless someone renamed it meanwhile.
-      if (renames === before) await update($, state, x => ({ ...x, pending: x.pending ?? title }))
+      await keep(title) // for the next turn's end
     })
   })
 }
@@ -239,8 +244,8 @@ export const register: Register = on => {
     $.clock.after(0, async () => {
       const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
       if (!title || renames !== handled) return
-      await update($, state, x => ({ ...x, title, pending: title }))
-      sendWhenIdle($)
+      await update($, state, x => (renames !== handled ? x : { ...x, title, pending: title }))
+      if (renames === handled) sendWhenIdle($)
     })
     return result
   })
