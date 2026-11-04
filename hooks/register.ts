@@ -139,7 +139,9 @@ export const awaitingAnswer = (messages: readonly SessionMessage[]): boolean => 
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!
     if (m.role === 'user') {
-      if (!m.toolResults?.length && isPersonText(m.text.trim())) return false
+      const text = m.text.trim()
+      // Blank rows aren't the person's answer: only words they typed close the question.
+      if (!m.toolResults?.length && text && isPersonText(text)) return false
       continue
     }
     const asks = m.toolUses.some(u => u.tool === WRAP_UP && typeof u.input.ask === 'string' && u.input.ask.trim() !== '')
@@ -166,7 +168,11 @@ const sendWhenIdle = ($: EngineInterface, { gate = false }: { gate?: boolean } =
     const { pending: title } = await read($, state)
     if (!title || busy() || renamed()) return
     // Pending stays: the next main-loop turn's end tries again.
-    if (gate && awaitingAnswer(await $.session.messages().catch(() => []))) return
+    if (gate) {
+      // An unreadable transcript can't show the question is answered: wait.
+      const messages = await $.session.messages().catch(() => undefined)
+      if (!messages || awaitingAnswer(messages)) return
+    }
     if (busy() || renamed()) return
     await update($, state, x => ({ ...x, pending: undefined }))
     if (renamed()) return

@@ -28,7 +28,15 @@ const engine = (on: On, opts: Opts = {}) => {
     rows.push({ role: 'user', text: framed, toolUses: [] })
     return { text: e.text }
   })
-  on('session.messages', () => ({ value: rows }) as never)
+  let unreadable = false
+  on('session.messages', () => {
+    if (unreadable) throw new Error('transcript unreadable')
+    return { value: rows } as never
+  })
+  /** Makes the transcript read fail from now on. */
+  const breakMessages = () => {
+    unreadable = true
+  }
   const renames: string[] = []
   let refusals = opts.failRenames ?? 0
   on('command.run', { command: 'rename' }, (_$, e) => {
@@ -49,7 +57,9 @@ const engine = (on: On, opts: Opts = {}) => {
   /** The tool results the engine records after a call: a `user` row, but not the person's. */
   const toolResult = () =>
     rows.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'x', text: 'ok' }] } as never)
-  return { renames, clock, say, toolResult }
+  /** A `user` row with no words and no tool results. */
+  const blankRow = () => rows.push({ role: 'user', text: '  ', toolUses: [] } as never)
+  return { renames, clock, say, toolResult, breakMessages, blankRow }
 }
 
 /** The engine, with a model that answers `reply` and records what it was asked. */
@@ -509,4 +519,24 @@ test('a question before the closing text and its tool result still holds the tit
   await turnEnd($, turnId)
   await clock.advance(SETTLE_MS * 4)
   expect(renames).toEqual([])
+})
+
+test('a blank user row after the question does not count as its answer', async ($, on) => {
+  const { renames, clock, say, blankRow } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  say({ recap: 'Built it.', ask: 'Commit this?' })
+  blankRow()
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS * 4)
+  expect(renames).toEqual([])
+})
+
+test('an unreadable transcript holds the title rather than risk closing a question', async ($, on) => {
+  const { renames, clock, breakMessages } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  breakMessages()
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS * 4)
+  expect(renames).toEqual([])
+  expect(await shown($)).toBe(TITLE)
 })
