@@ -5,6 +5,7 @@ import type { On } from 'claude-code'
 import { clean, digest, SETTLE_MS } from './register'
 
 const TITLE = 'feat(SessionTitle): auto-name sessions by convention'
+const WRAP_UP = 'mcp__ccd_turn__wrap_up'
 
 type Opts = { history?: { role: string; text: string }[]; drop?: string; failRenames?: number }
 
@@ -38,7 +39,17 @@ const engine = (on: On, opts: Opts = {}) => {
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   const clock = mock.clock(on)
-  return { renames, clock }
+  /** Claude's closing message for the running turn, ending with a desktop `wrap_up` (an `ask` opens its question box). */
+  const say = (wrapUp?: { recap: string; ask?: string }) =>
+    rows.push({
+      role: 'assistant',
+      text: 'Done.',
+      toolUses: wrapUp ? [{ tool_use_id: `t${rows.length}`, tool: WRAP_UP, input: wrapUp, text: 'ok' }] : [],
+    } as never)
+  /** The tool results the engine records after a call: a `user` row, but not the person's. */
+  const toolResult = () =>
+    rows.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'x', text: 'ok' }] } as never)
+  return { renames, clock, say, toolResult }
 }
 
 /** The engine, with a model that answers `reply` and records what it was asked. */
@@ -432,4 +443,70 @@ test('no second call when the session model is haiku itself', async ($, on) => {
   await submit($, clock, 'make a hook that renames sessions')
   expect(renames).toEqual([])
   expect(models).toEqual(['haiku'])
+})
+
+test('a first turn that ends on a question holds the title until a turn ends without one', async ($, on) => {
+  const { renames, clock, say } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  say({ recap: 'Built it, not committed.', ask: 'Commit this?' })
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS * 20)
+  // The question box is open after the turn: a /rename row would close it.
+  expect(renames).toEqual([])
+  expect(await shown($)).toBe(TITLE)
+  await $.prompt.submit({ text: 'yes', origin: { kind: 'composer' }, wait: false } as never)
+  const next = await turnStart($)
+  say({ recap: 'Committed.' })
+  await turnEnd($, next)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test('a wrap-up with only a recap does not hold the title', async ($, on) => {
+  const { renames, clock, say } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  say({ recap: 'Answered the question.' })
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test("a question from an earlier turn doesn't hold a later turn's send", async ($, on) => {
+  const { renames, clock, say } = stub(on, TITLE, { failRenames: 1 })
+  // Turn 1 ends with no question but its /rename is refused, so the title waits.
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([])
+  say({ recap: 'Old.', ask: 'Old question?' })
+  await $.prompt.submit({ text: 'carry on', origin: { kind: 'composer' }, wait: false } as never)
+  const next = await turnStart($)
+  say({ recap: 'Done.' })
+  await turnEnd($, next)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+})
+
+test('/autoname right after a turn that ended on a question still renames', async ($, on) => {
+  const { renames, clock, say } = stub(on, TITLE)
+  await submit($, clock, 'make a hook that renames sessions')
+  expect(renames).toEqual([TITLE])
+  await $.prompt.submit({ text: 'and one more thing', origin: { kind: 'composer' }, wait: false } as never)
+  const next = await turnStart($)
+  say({ recap: 'Did it.', ask: 'Ship it?' })
+  await turnEnd($, next)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE])
+  expect((await $.command.run({ command: 'autoname', args: '' } as never)).text).toBe(`Renamed: ${TITLE}`)
+  await clock.advance(SETTLE_MS)
+  expect(renames).toEqual([TITLE, TITLE])
+})
+
+test('a question before the closing text and its tool result still holds the title', async ($, on) => {
+  const { renames, clock, say, toolResult } = stub(on, TITLE)
+  const turnId = await openFirstTurn($, clock)
+  say({ recap: 'Built it.', ask: 'Commit this?' })
+  toolResult()
+  say()
+  await turnEnd($, turnId)
+  await clock.advance(SETTLE_MS * 4)
+  expect(renames).toEqual([])
 })

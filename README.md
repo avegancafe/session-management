@@ -17,7 +17,7 @@ Restart Claude Code afterwards; plugins load at session start.
 
 | Piece | Behavior |
 |-------|----------|
-| Auto title | Haiku titles the session **once**, from the first message you send, and never touches it again. Wakeups, task notifications, other injected messages and slash commands don't count, and a session that already has a name (resumed, renamed, or started with `--name`) is left alone. The title is applied once your first turn has ended, so it never interrupts a question Claude is asking you. |
+| Auto title | Haiku titles the session **once**, from the first message you send, and never touches it again. Wakeups, task notifications, other injected messages and slash commands don't count, and a session that already has a name (resumed, renamed, or started with `--name`) is left alone. The title is applied once your first turn has ended, so it never interrupts a question Claude is asking you — and if that turn ends on a question (the desktop app's next-step box), it waits for a later turn that doesn't. If every turn ends on a question, the title keeps waiting; there is no timeout. |
 | `/session-title` | Shows the title it chose. |
 | `/autoname [hint]` | Re-titles the session any time from its whole history (your messages and Claude's replies; tool calls left out, long sessions cut to the first prompt plus the latest turns), then applies it with `/rename`. Optional text after it, e.g. `/autoname mostly the bootstrap fix`, is weighed on top of the history. |
 | `/archive-session [reason]` | Archives the current session (Claude desktop app only). Checks for uncommitted or unpushed work first, since archiving removes a worktree session's worktree. You can also just ask Claude to "archive this session". |

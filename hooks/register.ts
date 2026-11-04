@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
 import type { TitleState } from '../types'
 
@@ -115,13 +115,42 @@ export const SETTLE_MS = 500
 // turn is open: when it's ready, if the session is idle, else when the turn
 // ends. An idle session runs the command at once, so it is never left in the
 // queue for a prompt that opens later. Reset by each load of the module.
+//
+// A turn's end isn't always free either: the desktop app draws a question
+// box (a `wrap_up` with an `ask`) after the turn has ended, and a `/rename`
+// row sent then closes it just the same. So the automatic title also waits
+// while the last turn ended on such a question (see awaitingAnswer), and goes
+// out at the end of a later turn that didn't.
 let turnOpen = false
 let starts = 0 // main-loop turns begun; a change means a turn began after the end
 let ends = 0 // main-loop turns ended
 let renames = 0 // /rename runs by hand (not this mod's own)
 
-/** Sends the pending title with `/rename` once the session has stood idle for SETTLE_MS. */
-const sendWhenIdle = ($: EngineInterface) => {
+/** The desktop app's end-of-turn tool: with an `ask`, it leaves a question box open once the turn ends. */
+const WRAP_UP = 'mcp__ccd_turn__wrap_up'
+
+/**
+ * Whether the latest turn ended on a question the person hasn't answered: a
+ * `wrap_up` with an `ask` since their last prompt. Tool results are `user`
+ * rows too, so the walk stops only at a row the person typed; the whole turn
+ * is scanned, since the closing text comes after the `wrap_up` call.
+ */
+export const awaitingAnswer = (messages: readonly SessionMessage[]): boolean => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!
+    if (m.role === 'user') {
+      if (!m.toolResults?.length && isPersonText(m.text.trim())) return false
+      continue
+    }
+    const asks = m.toolUses.some(u => u.tool === WRAP_UP && typeof u.input.ask === 'string' && u.input.ask.trim() !== '')
+    if (asks) return true
+  }
+  return false
+}
+
+/** Sends the pending title with `/rename` once the session has stood idle for SETTLE_MS.
+ * `gate`: also wait while the last turn ended on an open question (the automatic title; `/autoname` is typed, so none is open). */
+const sendWhenIdle = ($: EngineInterface, { gate = false }: { gate?: boolean } = {}) => {
   if (turnOpen) return
   const seen = starts
   const named = renames
@@ -136,6 +165,9 @@ const sendWhenIdle = ($: EngineInterface) => {
   $.clock.after(SETTLE_MS, async () => {
     const { pending: title } = await read($, state)
     if (!title || busy() || renamed()) return
+    // Pending stays: the next main-loop turn's end tries again.
+    if (gate && awaitingAnswer(await $.session.messages().catch(() => []))) return
+    if (busy() || renamed()) return
     await update($, state, x => ({ ...x, pending: undefined }))
     if (renamed()) return
     if (busy()) return void (await keep(title))
@@ -167,7 +199,7 @@ export const register: Register = on => {
     ends += 1
     // After an interrupt the engine refuses plugin commands until the person
     // acts again; the title waits for the next turn's end.
-    if (!e.isAborted) sendWhenIdle($)
+    if (!e.isAborted) sendWhenIdle($, { gate: true })
     return result
   })
 
@@ -245,7 +277,7 @@ export const register: Register = on => {
       const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
       if (!title || renames !== handled) return
       await update($, state, x => (renames !== handled ? x : { ...x, title, pending: title }))
-      if (renames === handled) sendWhenIdle($)
+      if (renames === handled) sendWhenIdle($, { gate: true })
     })
     return result
   })

@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-04
+
+### Fixed
+- The automatic title no longer closes a question Claude asks at the end of a turn. In the Claude desktop app, a turn can end with a question box (the next-step box with answer buttons) that opens after the turn is over, so the `/rename` sent once the session stood idle landed on it and dismissed it. The title now also waits while the last turn ended on such a question, and is applied at the end of a later turn that didn't. If every turn ends on a question, the title keeps waiting. `/autoname` is unchanged: you typed it, so no question is open.
+
 ## [1.3.0] - 2026-10-31
 
 ### Added
