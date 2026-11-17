@@ -9,7 +9,7 @@ const MAX_LEN = 72
 const HISTORY_LEN = 6000
 
 const PLUGIN = 'session-management' // this plugin's name, as the engine stamps `e.origin`
-const state = atom({ plugin: 'session-management', key: 'sessionTitle' } as const, { done: false } as TitleState)
+const state = atom({ plugin: 'session-management', key: 'sessionTitle' } as const, {} as TitleState)
 
 /** A trailing word a truncated title shouldn't end on. */
 const DANGLING_RE = /\s+(and|or|but|the|a|an|to|of|for|with|in|on)$/i
@@ -108,19 +108,21 @@ const isFromPerson = (kind: string) => kind === 'composer' || kind === 'bridge' 
  */
 export const SETTLE_MS = 500
 
-// The title is applied with `/rename` through `$.command.run`, which puts it
-// in the session's input queue. Queued while a turn is under way, it lands on
-// whatever that turn waits on — a question or plan-approval prompt — and
-// closes it. So a title waits in `pending` and is sent only while no main-loop
-// turn is open: when it's ready, if the session is idle, else when the turn
+// `/autoname`'s title is applied with `/rename` through `$.command.run`, which
+// puts it in the session's input queue. Queued while a turn is under way, it
+// lands on whatever that turn waits on — a question or plan-approval prompt —
+// and closes it. So a title waits in `pending` and is sent only while no
+// main-loop turn is open: at once if the session is idle, else when the turn
 // ends. An idle session runs the command at once, so it is never left in the
 // queue for a prompt that opens later. Reset by each load of the module.
 //
 // A turn's end isn't always free either: the desktop app draws a question
 // box (a `wrap_up` with an `ask`) after the turn has ended, and a `/rename`
-// row sent then closes it just the same. So the automatic title also waits
-// while the last turn ended on such a question (see awaitingAnswer), and goes
-// out at the end of a later turn that didn't.
+// row sent then closes it just the same. So a title still pending at a turn's
+// end (it found the session busy, or its `/rename` was refused) also waits
+// while that turn ended on such a question (see awaitingAnswer), and goes out
+// at the end of a later turn that didn't. Nothing here titles a session on
+// its own: a title only ever comes from `/autoname`.
 let turnOpen = false
 let starts = 0 // main-loop turns begun; a change means a turn began after the end
 let ends = 0 // main-loop turns ended
@@ -151,7 +153,7 @@ export const awaitingAnswer = (messages: readonly SessionMessage[]): boolean => 
 }
 
 /** Sends the pending title with `/rename` once the session has stood idle for SETTLE_MS.
- * `gate`: also wait while the last turn ended on an open question (the automatic title; `/autoname` is typed, so none is open). */
+ * `gate`: also wait while the last turn ended on an open question (a retry at a turn's end; `/autoname` itself is typed, so none is open). */
 const sendWhenIdle = ($: EngineInterface, { gate = false }: { gate?: boolean } = {}) => {
   if (turnOpen) return
   const seen = starts
@@ -210,7 +212,7 @@ export const register: Register = on => {
   })
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: COMMAND, description: 'Show the auto session title' })
+    await $.command.register({ name: COMMAND, description: 'Show the title /autoname chose' })
     await $.command.register({
       name: AUTONAME,
       description: 'Re-title this session from its history, by the session-title convention',
@@ -235,56 +237,32 @@ export const register: Register = on => {
       .join('\n\n')
     const title = await generate($, body).catch(() => undefined)
     if (!title) return { text: "Couldn't generate a title. Try `/autoname <hint>`." }
-    await update($, state, x => ({ ...x, title, pending: title, done: true }))
+    await update($, state, x => ({ ...x, title, pending: title }))
     sendWhenIdle($)
     return { text: `Renamed: ${title}` }
   })
 
-  // A session the person names by hand is theirs: the first-prompt title
-  // never overwrites it, even one still waiting for the turn to end.
+  // A name the person gives by hand wins: an `/autoname` title still waiting
+  // for the turn to end is dropped, not sent over it.
   on('command.run', { command: 'rename' }, async ($, e, next) => {
     if (e.origin?.kind === 'plugin' && e.origin.name === PLUGIN) return next(e)
     renames += 1
-    await update($, state, x => ({ ...x, pending: undefined, done: true }))
+    await update($, state, x => ({ ...x, pending: undefined }))
     return next(e)
   })
 
-  // Titles the session once, from the first message the person sends, and
-  // never touches it again. This is `prompt.submit`, not the classic
-  // UserPromptSubmit: on a managed machine the built-in sec-default plugin
-  // sends classic events past every user-installed plugin's hooks.
+  // Never titles anything: it only marks the turn a typed prompt starts as
+  // open, in case this mod never hears that turn's start, so a pending
+  // `/autoname` title isn't sent into it. This is `prompt.submit`, not the
+  // classic UserPromptSubmit: on a managed machine the built-in sec-default
+  // plugin sends classic events past every user-installed plugin's hooks.
   on('prompt.submit', async ($, e, next) => {
     const ended = ends
     const result = await next(e)
     if (result.drop !== undefined || e.command || e.isMeta || !isFromPerson(e.origin.kind)) return result
-    // The prompt entered and its turn started; held open even if this mod
-    // never hears that turn's start, until it hears the end.
+    // The prompt entered and its turn started; held open until this mod
+    // hears the end.
     if (ends === ended) turnOpen = true
-
-    const s = await read($, state)
-    if (s.done) return result
-
-    const text = e.text.trim()
-    if (!text || !isPersonText(text)) return result
-
-    // Mark done first, so a slow or failed call never retries on a later prompt.
-    await update($, state, x => ({ ...x, done: true }))
-    // A resumed session already has its name: the person spoke before this prompt.
-    const earlier = (await $.session.messages()).filter(
-      m => m.role === 'user' && m.text.trim() !== text && isPersonText(m.text.trim()),
-    )
-    if (earlier.length > 0) return result
-
-    // Titled from a timer, off the turn's critical path: the prompt has
-    // already entered, and the hook returns without waiting on the model.
-    // The title is sent once the session is idle (see sendWhenIdle).
-    const handled = renames
-    $.clock.after(0, async () => {
-      const title = await generate($, `Request:\n${clip(text, 1500)}`).catch(() => undefined)
-      if (!title || renames !== handled) return
-      await update($, state, x => (renames !== handled ? x : { ...x, title, pending: title }))
-      if (renames === handled) sendWhenIdle($, { gate: true })
-    })
     return result
   })
 }
