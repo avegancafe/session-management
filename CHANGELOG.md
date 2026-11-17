@@ -4,6 +4,11 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-17
+
+### Removed
+- Automatic first-prompt titles. The mod no longer titles a session from your first message: it renamed sessions that had been named at launch with `claude -n` (for example by a tool that opens named sessions), and other sessions address each other by that name. A session now keeps its name until you run `/autoname` or `/rename`. `/autoname` and `/session-title` work as before, and an `/autoname` title still waits for the turn to end (and for any end-of-turn question to be answered) before it is applied.
+
 ## [1.3.1] - 2026-11-04
 
 ### Fixed

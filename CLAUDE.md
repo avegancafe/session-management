@@ -23,7 +23,7 @@ Guidance for Claude Code when working **on this repository**, not when using the
 ```
 .claude-plugin/plugin.json   # Manifest (name, version, types)
 hooks/hooks.json             # { "modules": ["./register.ts"] }
-hooks/register.ts            # The session-title mod: auto title, /session-title, /autoname
+hooks/register.ts            # The session-title mod: /session-title, /autoname
 hooks/register.test.ts       # Mod tests (claude-code/testing)
 types/index.d.ts             # PluginState typing
 skills/archive-session/SKILL.md  # /archive-session: archive this desktop session
